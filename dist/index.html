@@ -1,0 +1,29 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>TPT CFD Studio — TPT AppFront</title>
+    <!-- data-wasm-opt="0" disables trunk's wasm-opt pass: the modern Rust
+         wasm target emits bulk-memory opcodes that the cached Binaryen
+         rejects, and the release profile (opt-level = "z", lto, strip)
+         already keeps the payload small. -->
+    
+<script type="module">
+import init, * as bindings from '/tpt-app-cfd-studio-855ed27a7d046996.js';
+const wasm = await init({ module_or_path: '/tpt-app-cfd-studio-855ed27a7d046996_bg.wasm' });
+
+
+window.wasmBindings = bindings;
+
+
+dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
+
+</script>
+  <link rel="modulepreload" href="/tpt-app-cfd-studio-855ed27a7d046996.js" crossorigin="anonymous" integrity="sha384-TLEFBuo4h/rSCaERvFzlGvy96W5qZE1uQqj+st1319+6hURknGYXw9ybaID2ww3n"><link rel="preload" href="/tpt-app-cfd-studio-855ed27a7d046996_bg.wasm" crossorigin="anonymous" integrity="sha384-0GSpdG98qfOZz2IeU9IFlz8xQDAFiVDfagjlr29XEFeO1iWHtO8nhsJh9Lvux9Zt" as="fetch" type="application/wasm"></head>
+  <body>
+    <!-- Marker div: `start()` mounts here for standalone dev only; when the
+         build is embedded in tptsolutions.co.nz/tools the hub runner calls
+         `mount(container)` itself and this file is never served. -->
+    <div id="tpt-appfront-root"></div>
+  </body>
+</html>

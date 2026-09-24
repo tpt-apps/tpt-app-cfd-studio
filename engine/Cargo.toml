@@ -1,0 +1,18 @@
+[package]
+name = "tpt-cfd-engine"
+version = "0.1.0"
+edition = "2021"
+description = "2D (and Pro: 3D) external-flow CFD adapter over tpt-physics' lattice-Boltzmann solver: body rasterisation, incremental stepping, momentum-exchange drag/lift. Pure Rust, no UI deps, host-testable."
+publish = false
+
+[features]
+default = []
+# Pro edition capabilities: the 3D D3Q19 external-flow solver and the PDF
+# report writer. Compiled out of the free WASM build to keep the payload
+# small.
+pro = []
+
+[dependencies]
+tpt-phys-cfd = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-physics/crates/tpt-phys-cfd" }
+# Instant that works on wasm32 (performance.now) and native hosts alike.
+web-time = "1"

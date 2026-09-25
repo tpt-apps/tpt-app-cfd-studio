@@ -19,7 +19,12 @@ use std::{cell::RefCell, rc::Rc};
 
 use tpt_appfront_core::{create_effect, Signal, UITree};
 use tpt_cfd_engine::{Fluid, Problem2D, Shape2D, Solver2D};
+#[cfg(feature = "pro")]
+use tpt_cfd_engine::threed::{Problem3D, Shape3D, Solver3D};
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast};
+
+#[cfg(feature = "pro")]
+use crate::viewer3d::Viewer3D;
 
 use crate::viewer::Viewer;
 
@@ -81,6 +86,25 @@ const SAMPLES: [SampleDef; 4] = [
     },
 ];
 
+/// (pro) 3D body shapes in picker order.
+#[cfg(feature = "pro")]
+const SHAPES_3D: [(&str, &str); 4] = [
+    ("Sphere", "sphere"),
+    ("Cube", "cube"),
+    ("Flat plate", "plate"),
+    ("Streamlined", "ellipsoid"),
+];
+
+/// (pro) 3D lattice presets: cells across the body. 3D cell counts explode
+/// (n³ per direction pair), so these stay small; Fine ≈ 221k cells.
+#[cfg(feature = "pro")]
+const QUALITY_3D: [usize; 2] = [8, 12];
+
+/// (pro) planned steps for the 3D default run (desktop wall-clock target:
+/// tens of seconds with a live progress readout).
+#[cfg(feature = "pro")]
+const PLAN_STEPS_3D: usize = 3_500;
+
 #[derive(Clone)]
 enum Msg {
     /// Pick a body shape (id matches [`Shape2D::id`]).
@@ -96,6 +120,21 @@ enum Msg {
     /// desktop shell (whose webview must not navigate away from the local
     /// bundle). See [`visit_site`].
     VisitSite(&'static str),
+    /// (pro) pick a 3D body shape.
+    #[cfg(feature = "pro")]
+    Shape3D(&'static str),
+    /// (pro) pick the 3D lattice preset (index into [`QUALITY_3D`]).
+    #[cfg(feature = "pro")]
+    Quality3D(usize),
+    /// (pro) start (or stop) the 3D solve.
+    #[cfg(feature = "pro")]
+    Run3D,
+    /// (pro) download the current 2D flow view as a PNG.
+    #[cfg(feature = "pro")]
+    ExportPng,
+    /// (pro) download the PDF report for the current solves.
+    #[cfg(feature = "pro")]
+    ExportReport,
 }
 
 struct App {
@@ -109,7 +148,7 @@ struct App {
     running: Rc<std::cell::Cell<bool>>,
     shape: std::cell::Cell<Shape2D>,
     quality: std::cell::Cell<usize>,
-    /// Adaptive stepping budget (lattice steps per animation frame).
+    /// Adaptive stepping budget (lattice steps per animation-frame chunk).
     steps_per_frame: std::cell::Cell<usize>,
     last_batch: std::cell::Cell<(usize, f64)>,
     /// `Date.now()` of the last completed stepping chunk — the watchdog
@@ -117,6 +156,17 @@ struct App {
     last_step_ms: std::cell::Cell<f64>,
     /// Watchdog interval id once installed.
     kick_id: std::cell::Cell<Option<i32>>,
+    /// (pro) 3D solve state — the 3D card shares the panel's flow inputs.
+    #[cfg(feature = "pro")]
+    solver3d: RefCell<Option<Solver3D>>,
+    #[cfg(feature = "pro")]
+    viewer3d: RefCell<Option<Viewer3D>>,
+    #[cfg(feature = "pro")]
+    running3d: Rc<std::cell::Cell<bool>>,
+    #[cfg(feature = "pro")]
+    shape3d: std::cell::Cell<Shape3D>,
+    #[cfg(feature = "pro")]
+    quality3d: std::cell::Cell<usize>,
 }
 
 pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
@@ -152,6 +202,16 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
         last_batch: std::cell::Cell::new((0, 0.0)),
         last_step_ms: std::cell::Cell::new(0.0),
         kick_id: std::cell::Cell::new(None),
+        #[cfg(feature = "pro")]
+        solver3d: RefCell::new(None),
+        #[cfg(feature = "pro")]
+        viewer3d: RefCell::new(None),
+        #[cfg(feature = "pro")]
+        running3d: Rc::new(std::cell::Cell::new(false)),
+        #[cfg(feature = "pro")]
+        shape3d: std::cell::Cell::new(Shape3D::Sphere),
+        #[cfg(feature = "pro")]
+        quality3d: std::cell::Cell::new(QUALITY_3D[0]),
     });
 
     let dispatch: Rc<dyn Fn(Msg)> = {
@@ -175,6 +235,28 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
                 }
             }
             Msg::VisitSite(url) => visit_site(url),
+            #[cfg(feature = "pro")]
+            Msg::Shape3D(id) => {
+                app.shape3d.set(shape3d_from_id(id));
+                patch_shape_buttons_by(&app.container, ".cfd-shape3", id);
+            }
+            #[cfg(feature = "pro")]
+            Msg::Quality3D(q) => {
+                app.quality3d.set(QUALITY_3D[q]);
+                patch_buttons_by(&app.container, ".cfd-q3", q, &["Coarse", "Fine"]);
+            }
+            #[cfg(feature = "pro")]
+            Msg::Run3D => {
+                if app.running3d.get() {
+                    stop_run3d(&app);
+                } else {
+                    start_3d_from_fields(&app);
+                }
+            }
+            #[cfg(feature = "pro")]
+            Msg::ExportPng => export_png(&app.container),
+            #[cfg(feature = "pro")]
+            Msg::ExportReport => export_report(&app),
         })
     };
 
@@ -190,6 +272,16 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
         .query_selector(".cfd-canvas-holder")?
         .ok_or_else(|| JsValue::from_str("canvas holder missing"))?;
     *app.viewer.borrow_mut() = Some(Viewer::attach(&document, &holder)?);
+
+    #[cfg(feature = "pro")]
+    {
+        let holder3 = container
+            .query_selector(".cfd-canvas3-holder")?
+            .ok_or_else(|| JsValue::from_str("3d canvas holder missing"))?;
+        *app.viewer3d.borrow_mut() = Some(Viewer3D::attach(&document, &holder3)?);
+        patch_shape_buttons_by(&app.container, ".cfd-shape3", "sphere");
+        patch_buttons_by(&app.container, ".cfd-q3", 0, &["Coarse", "Fine"]);
+    }
 
     // Draw/redraw on every tick; the effect also chains the next animation
     // frame while a solve is running.
@@ -336,6 +428,12 @@ fn shell_tree() -> UITree<Msg> {
                         .class("cfd-status-note");
                 })
                 .class("cfd-status");
+
+                #[cfg(feature = "pro")]
+                {
+                    pro_results_card(view);
+                    pro_3d_card(view);
+                }
             })
             .class("cfd-view");
         })
@@ -354,6 +452,101 @@ fn shape_from_id(id: &str) -> Shape2D {
         "ellipse" => Shape2D::Ellipse { aspect: 4.0 },
         _ => Shape2D::Circle,
     }
+}
+
+/// (pro) Coefficient readout + export buttons card (view column).
+#[cfg(feature = "pro")]
+fn pro_results_card(view: &mut tpt_appfront_core::ContainerBuilder<Msg>) {
+    view.container(|card| {
+        card.container(|row| {
+            row.text("Pro results").class("cfd-chip");
+        })
+        .class("cfd-upsell-head");
+        card.heading(3, "Drag & lift coefficients").class("cfd-card-title");
+        card.container(|grid| {
+            grid.container(|cell| {
+                cell.text("Drag coefficient Cd").class("cfd-label");
+                cell.container(|l| {
+                    l.text("—");
+                })
+                .class("cfd-coeff cfd-cd-value");
+            })
+            .class("cfd-coeff-cell");
+            grid.container(|cell| {
+                cell.text("Lift coefficient Cl").class("cfd-label");
+                cell.container(|l| {
+                    l.text("—");
+                })
+                .class("cfd-coeff cfd-cl-value");
+            })
+            .class("cfd-coeff-cell");
+            grid.container(|cell| {
+                cell.text("3D drag coefficient Cd").class("cfd-label");
+                cell.container(|l| {
+                    l.text("—");
+                })
+                .class("cfd-coeff cfd-cd3-value");
+            })
+            .class("cfd-coeff-cell");
+        })
+        .class("cfd-coeff-grid");
+        card.container(|row| {
+            row.button("Export PNG")
+                .class("cfd-sample")
+                .on_click(Msg::ExportPng);
+            row.button("Export PDF report")
+                .class("cfd-sample")
+                .on_click(Msg::ExportReport);
+        })
+        .class("cfd-actions");
+    })
+    .class("cfd-card cfd-pro-card");
+}
+
+/// (pro) 3D external-flow card: shape picker, resolution, run button,
+/// status lines, slice canvas. Shares the Flow card's speed/size inputs.
+#[cfg(feature = "pro")]
+fn pro_3d_card(view: &mut tpt_appfront_core::ContainerBuilder<Msg>) {
+    view.container(|card| {
+        card.heading(3, "3D external flow").class("cfd-card-title");
+        card.container(|row| {
+            for (label, id) in SHAPES_3D {
+                row.button(label)
+                    .class("cfd-shape3")
+                    .attr("data-shape3", id)
+                    .on_click(Msg::Shape3D(id));
+            }
+        })
+        .class("cfd-shapes");
+        card.container(|field| {
+            field.text("3D resolution").class("cfd-label");
+            field.container(|row| {
+                row.button("Coarse").class("cfd-q3").on_click(Msg::Quality3D(0));
+                row.button("Fine").class("cfd-q3").on_click(Msg::Quality3D(1));
+            })
+            .class("cfd-shapes");
+        })
+        .class("cfd-field");
+        card.button("Run 3D solve")
+            .class("cfd-run-btn cfd-run3d-btn")
+            .on_click(Msg::Run3D);
+        card.container(|status| {
+            status
+                .container(|line| {
+                    line.text("3D — press Run to solve.");
+                })
+                .class("cfd-status3d-main");
+            status
+                .container(|line| {
+                    line.text("Solves the same speed/size inputs in three dimensions.");
+                })
+                .class("cfd-status3d-note");
+        })
+        .class("cfd-status");
+        card.container(|_| {})
+            .class("cfd-canvas3-holder");
+    })
+    .class("cfd-card");
 }
 
 /// Reads the panel fields and (re)starts the animated solve.
@@ -458,13 +651,33 @@ fn stop_run(app: &Rc<App>) {
 /// watchdog (below) passes a larger one when the animation loop is stalled.
 fn do_frame(app: &Rc<App>, budget_ms: f64) {
     app.raf.borrow_mut().take();
-    if !app.running.get() {
+    if !any_running(app) {
         return;
     }
     let t0 = js_sys::Date::now();
     loop {
-        if !app.running.get() {
+        if !any_running(app) {
             return;
+        }
+        // (pro) one 3D lattice step per chunk — a single 3D step costs as
+        // much as ~30 2D steps at Fine resolution, so it gets its own slice
+        // of every frame.
+        #[cfg(feature = "pro")]
+        if app.running3d.get() {
+            let done3 = {
+                let mut slot = app.solver3d.borrow_mut();
+                match slot.as_mut() {
+                    Some(solver) => {
+                        solver.step_batch(1);
+                        solver.is_complete()
+                    }
+                    None => true,
+                }
+            };
+            if done3 {
+                app.running3d.set(false);
+                set_run3d_label(&app.container, false);
+            }
         }
         let steps = app.steps_per_frame.get();
         let chunk_t0 = js_sys::Date::now();
@@ -500,9 +713,21 @@ fn do_frame(app: &Rc<App>, budget_ms: f64) {
     app.tick.set(app.tick.get() + 1);
 }
 
+/// `true` while any solve (2D, or Pro 3D) is still stepping.
+#[cfg(not(feature = "pro"))]
+fn any_running(app: &App) -> bool {
+    app.running.get()
+}
+
+/// `true` while any solve (2D, or Pro 3D) is still stepping.
+#[cfg(feature = "pro")]
+fn any_running(app: &App) -> bool {
+    app.running.get() || app.running3d.get()
+}
+
 /// Requests the next animation frame while a solve is running.
 fn schedule_next_frame(app: &Rc<App>) {
-    if !app.running.get() || app.raf.borrow().is_some() {
+    if !any_running(app) || app.raf.borrow().is_some() {
         return;
     }
     let Some(window) = web_sys::window() else {
@@ -532,7 +757,7 @@ fn ensure_kick_timer(app: &Rc<App>) {
     };
     let app2 = app.clone();
     let closure = Closure::wrap(Box::new(move || {
-        if !app2.running.get() {
+        if !any_running(&app2) {
             return;
         }
         if js_sys::Date::now() - app2.last_step_ms.get() > 1200.0 {
@@ -561,6 +786,88 @@ fn draw_frame(app: &Rc<App>) {
         let _ = viewer.draw(solver, app.running.get(), app.steps_per_frame.get() as f64);
     }
     update_status(app, Some(solver));
+    update_coefficients(app, Some(solver));
+    #[cfg(feature = "pro")]
+    update_3d(app);
+}
+
+/// (pro) redraws the 3D slices and the 3D status/coefficients.
+#[cfg(feature = "pro")]
+fn update_3d(app: &Rc<App>) {
+    let mut slot = app.solver3d.borrow_mut();
+    let Some(solver) = slot.as_mut() else {
+        return;
+    };
+    if let Some(viewer) = app.viewer3d.borrow().as_ref() {
+        let _ = viewer.draw(solver);
+    }
+
+    let info = solver.info();
+    let progress = (solver.steps_run() as f64 / solver.planned_steps() as f64 * 100.0) as usize;
+    let re = fmt_re(info.reynolds);
+    let cap_note = if info.reynolds_capped {
+        format!(
+            "Target Re {} exceeds the 3D stable band — solving at Re {}.",
+            fmt_re(solver.problem().reynolds()),
+            re
+        )
+    } else {
+        format!("Re = {}", re)
+    };
+    if solver.diverged() {
+        set_status3d(
+            &app.container,
+            "3D solver diverged.",
+            "Try the Coarse resolution or a lower speed, then run again.",
+        );
+    } else if app.running3d.get() {
+        set_status3d(
+            &app.container,
+            &format!("3D solving — {}×{}×{} lattice · {}%", info.nx, info.ny, info.nz, progress.min(99)),
+            &format!("{} · rough coefficients at this resolution", cap_note),
+        );
+    } else {
+        set_status3d(
+            &app.container,
+            &format!(
+                "3D done — {}×{}×{} lattice · {} steps",
+                info.nx,
+                info.ny,
+                info.nz,
+                fmt_re(solver.steps_run() as f64)
+            ),
+            &format!(
+                "{} · 3D coefficients are rough estimates; 2D carries shape comparisons",
+                cap_note
+            ),
+        );
+    }
+
+    let cd3 = match solver.drag_coefficient() {
+        Some(cd) => format!("{cd:.3}"),
+        None => "settling…".to_string(),
+    };
+    set_text(&app.container, ".cfd-cd3-value", &cd3);
+}
+
+/// (pro) writes the 2D time-averaged coefficients into the results card.
+#[cfg(feature = "pro")]
+fn update_coefficients(app: &Rc<App>, solver: Option<&Solver2D>) {
+    let (cd, cl) = match solver {
+        Some(solver) if solver.diverged() => ("diverged".to_string(), "—".to_string()),
+        Some(solver) => match (solver.drag_coefficient(), solver.lift_coefficient()) {
+            (Some(cd), Some(cl)) => (format!("{cd:.3}"), format!("{cl:+.3}")),
+            _ => ("settling…".to_string(), "settling…".to_string()),
+        },
+        None => ("—".to_string(), "—".to_string()),
+    };
+    set_text(&app.container, ".cfd-cd-value", &cd);
+    set_text(&app.container, ".cfd-cl-value", &cl);
+}
+
+#[cfg(not(feature = "pro"))]
+fn update_coefficients(app: &Rc<App>, solver: Option<&Solver2D>) {
+    let _ = (app, solver);
 }
 
 fn update_status(app: &Rc<App>, solver: Option<&Solver2D>) {
@@ -680,11 +987,331 @@ fn patch_quality_buttons(container: &web_sys::Element, selected: usize) {
     }
 }
 
-fn visit_site(url: &str) {
+/// (pro) resolves a 3D shape picker id.
+#[cfg(feature = "pro")]
+fn shape3d_from_id(id: &str) -> Shape3D {
+    match id {
+        "cube" => Shape3D::Cube,
+        "plate" => Shape3D::Plate,
+        "ellipsoid" => Shape3D::Ellipsoid { aspect: 2.5 },
+        _ => Shape3D::Sphere,
+    }
+}
+
+/// Highlights selected buttons by class prefix + attribute (shared by the
+/// 2D and Pro pickers, which live in the mounted-once tree).
+#[cfg(feature = "pro")]
+fn patch_shape_buttons_by(container: &web_sys::Element, class: &str, selected: &str) {
+    for (_, id) in SHAPES_3D {
+        if let Some(Some(el)) = container
+            .query_selector(&format!("{class}[data-shape3='{id}']"))
+            .ok()
+            .map(|o| o)
+        {
+            let cls = if id == selected {
+                format!("{class} cfd-sel")
+            } else {
+                class.to_string()
+            };
+            let _ = el.set_attribute("class", &cls);
+        }
+    }
+}
+
+/// Highlights the selected option among a same-class button group.
+#[cfg(feature = "pro")]
+fn patch_buttons_by(container: &web_sys::Element, class: &str, selected: usize, labels: &[&str]) {
+    for (i, label) in labels.iter().enumerate() {
+        if let Some(Some(el)) = container
+            .query_selector(&format!("{class}:nth-of-type({})", i + 1))
+            .ok()
+            .map(|o| o)
+        {
+            let _ = el.set_text_content(Some(label));
+            let cls = if i == selected {
+                format!("{class} cfd-sel")
+            } else {
+                class.to_string()
+            };
+            let _ = el.set_attribute("class", &cls);
+        }
+    }
+}
+
+/// (pro) starts the 3D solve from the shared Flow inputs.
+#[cfg(feature = "pro")]
+fn start_3d_from_fields(app: &Rc<App>) {
+    let read = |selector: &str| -> Option<f64> {
+        app.container
+            .query_selector(selector)
+            .ok()
+            .flatten()
+            .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().ok())
+            .and_then(|input| input.value().trim().parse::<f64>().ok())
+    };
+    let (Some(speed), Some(size)) = (read(".cfd-inlet"), read(".cfd-size")) else {
+        set_status3d(&app.container, "3D — check the Flow inputs first.", "");
+        return;
+    };
+    if !(0.0001..=300.0).contains(&speed) || !(0.005..=20.0).contains(&size) {
+        set_status3d(&app.container, "3D — speed/size are outside their ranges.", "");
+        return;
+    }
+    let problem = Problem3D {
+        shape: app.shape3d.get(),
+        body_height: size,
+        inlet_velocity: speed,
+        fluid: Fluid::AIR,
+        cells_across_body: app.quality3d.get(),
+    };
+    match Solver3D::new(&problem) {
+        Ok(solver) => {
+            *app.solver3d.borrow_mut() = Some(solver);
+            app.running3d.set(true);
+            set_run3d_label(&app.container, true);
+            app.tick.set(app.tick.get() + 1);
+        }
+        Err(error) => set_status3d(&app.container, "3D — cannot start:", &error.0),
+    }
+}
+
+/// (pro) stops the 3D solve (finished or not).
+#[cfg(feature = "pro")]
+fn stop_run3d(app: &Rc<App>) {
+    app.running3d.set(false);
+    set_run3d_label(&app.container, false);
+    app.tick.set(app.tick.get() + 1);
+}
+
+#[cfg(feature = "pro")]
+fn set_run3d_label(container: &web_sys::Element, running: bool) {
+    set_text(
+        container,
+        ".cfd-run3d-btn",
+        if running { "Stop 3D" } else { "Run 3D solve" },
+    );
+}
+
+#[cfg(feature = "pro")]
+fn set_status3d(container: &web_sys::Element, main: &str, note: &str) {
+    set_text(container, ".cfd-status3d-main", main);
+    set_text(container, ".cfd-status3d-note", note);
+}
+
+/// Writes text content into the (container-wrapped) node at `selector`.
+#[cfg(feature = "pro")]
+fn set_text(container: &web_sys::Element, selector: &str, text: &str) {
+    if let Some(Some(el)) = container.query_selector(selector).ok().map(|o| o) {
+        el.set_text_content(Some(text));
+    }
+}
+
+/// (pro) downloads the 2D flow canvas as a PNG.
+#[cfg(feature = "pro")]
+fn export_png(container: &web_sys::Element) {
     let Some(window) = web_sys::window() else {
         return;
     };
-    let in_desktop_shell = window
+    let Some(document) = window.document() else {
+        return;
+    };
+    let Some(Some(canvas)) = container.query_selector(".cfd-canvas").ok().map(|o| o) else {
+        return;
+    };
+    let Ok(canvas) = canvas.dyn_into::<web_sys::HtmlCanvasElement>() else {
+        return;
+    };
+    let callback = Closure::once(move |blob: Option<web_sys::Blob>| {
+        if let Some(blob) = blob {
+            download_blob(&document, &blob, "cfd-studio-flow.png");
+        }
+    });
+    if canvas.to_blob(callback.as_ref().unchecked_ref()).is_ok() {
+        callback.forget(); // ownership passes to the JS callback queue
+    }
+}
+
+/// (pro) builds and downloads the PDF report for the current solves.
+#[cfg(feature = "pro")]
+fn export_report(app: &Rc<App>) {
+    let rows = report_rows(app);
+    let pdf = tpt_cfd_engine::report::render_pdf("TPT CFD Studio Report", &rows);
+    let Some(window) = web_sys::window() else {
+        return;
+    };
+    let Some(document) = window.document() else {
+        return;
+    };
+    let array = js_sys::Array::new();
+    array.push(&js_sys::Uint8Array::from(pdf.as_slice()));
+    match web_sys::Blob::new_with_u8_array_sequence(&array) {
+        Ok(blob) => download_blob(&document, &blob, "cfd-studio-report.pdf"),
+        Err(_) => (),
+    }
+}
+
+/// Triggers a browser download of `blob` under `name`.
+#[cfg(feature = "pro")]
+fn download_blob(document: &web_sys::Document, blob: &web_sys::Blob, name: &str) {
+    let Ok(url) = web_sys::Url::create_object_url_with_blob(blob) else {
+        return;
+    };
+    if let Ok(anchor) = document.create_element("a") {
+        let _ = anchor.set_attribute("href", &url);
+        let _ = anchor.set_attribute("download", name);
+        if let Some(body) = document.body() {
+            let _ = body.append_child(&anchor);
+        }
+        if let Ok(a) = anchor.dyn_into::<web_sys::HtmlAnchorElement>() {
+            a.click();
+            if let Some(body) = document.body() {
+                let _ = body.remove_child(&a);
+            }
+        }
+    }
+    let _ = web_sys::Url::revoke_object_url(&url);
+}
+
+/// (pro) assembles the report rows from whatever has been solved.
+#[cfg(feature = "pro")]
+fn report_rows(app: &Rc<App>) -> Vec<tpt_cfd_engine::report::Row> {
+    use tpt_cfd_engine::report::Row;
+
+    let stamp = js_sys::Date::new_0().to_iso_string();
+    let mut rows: Vec<Row> = vec![
+        Row::Title("TPT CFD Studio — Flow Report".into()),
+        Row::Note(format!(
+            "Generated {stamp} · TPT CFD Studio Pro (lattice-Boltzmann external flow)"
+        )),
+        Row::Gap(6.0),
+    ];
+
+    {
+        let slot = app.solver.borrow();
+        if let Some(solver) = slot.as_ref() {
+            let info = solver.info();
+            let problem = solver.problem();
+            let cap = if info.reynolds_capped {
+                format!(
+                    "{} (capped at the solver's stable ceiling)",
+                    fmt_re(info.reynolds)
+                )
+            } else {
+                fmt_re(info.reynolds)
+            };
+            rows.push(Row::Head("2D problem".into()));
+            rows.push(Row::Table {
+                columns: vec!["Field".into(), "Value".into()],
+                rows: vec![
+                    vec!["Body".into(), problem.shape.label().into()],
+                    vec![
+                        "Frontal height".into(),
+                        format!("{:.3} m", problem.body_height),
+                    ],
+                    vec![
+                        "Free-stream speed".into(),
+                        format!("{:.3} m/s", problem.inlet_velocity),
+                    ],
+                    vec![
+                        "Fluid".into(),
+                        format!(
+                            "air (rho = {:.3} kg/m3, nu = {:.3e} m2/s)",
+                            problem.fluid.density, problem.fluid.kinematic_viscosity
+                        ),
+                    ],
+                    vec!["Reynolds (target)".into(), fmt_re(problem.reynolds())],
+                    vec!["Reynolds (simulated)".into(), cap],
+                ],
+                weights: Some(vec![0.35, 0.65]),
+            });
+            rows.push(Row::Gap(4.0));
+            rows.push(Row::Head("2D results".into()));
+            let (cd_text, cl_text);
+            if solver.diverged() {
+                cd_text = "diverged".to_string();
+                cl_text = "-".to_string();
+            } else if let (Some(cd), Some(cl)) =
+                (solver.drag_coefficient(), solver.lift_coefficient())
+            {
+                cd_text = format!("{cd:.3}");
+                cl_text = format!("{cl:+.3}");
+            } else {
+                cd_text = "not settled".to_string();
+                cl_text = "not settled".to_string();
+            }
+            rows.push(Row::Table {
+                columns: vec!["Quantity".into(), "Value".into()],
+                rows: vec![
+                    vec!["Drag coefficient Cd".into(), cd_text],
+                    vec!["Lift coefficient Cl".into(), cl_text],
+                    vec![
+                        "Lattice".into(),
+                        format!("{} x {} cells", info.nx, info.ny),
+                    ],
+                    vec!["Steps run".into(), fmt_re(solver.steps_run() as f64)],
+                ],
+                weights: Some(vec![0.45, 0.55]),
+            });
+        }
+    }
+
+    #[cfg(feature = "pro")]
+    {
+        let slot = app.solver3d.borrow();
+        if let Some(solver) = slot.as_ref() {
+            let info = solver.info();
+            rows.push(Row::Gap(4.0));
+            rows.push(Row::Head("3D results (rough estimates)".into()));
+            rows.push(Row::Table {
+                columns: vec!["Field".into(), "Value".into()],
+                rows: vec![
+                    vec!["Body".into(), solver.problem().shape.label().into()],
+                    vec![
+                        "Lattice".into(),
+                        format!("{} x {} x {} cells", info.nx, info.ny, info.nz),
+                    ],
+                    vec!["Reynolds (simulated)".into(), fmt_re(info.reynolds)],
+                    vec!["Steps run".into(), fmt_re(solver.steps_run() as f64)],
+                    vec![
+                        "Drag coefficient Cd".into(),
+                        match solver.drag_coefficient() {
+                            Some(cd) => format!("{cd:.3}"),
+                            None => "not settled".into(),
+                        },
+                    ],
+                ],
+                weights: Some(vec![0.45, 0.55]),
+            });
+        }
+    }
+
+    rows.push(Row::Gap(4.0));
+    rows.push(Row::Head("Method & accuracy".into()));
+    rows.push(Row::Body(
+        "Lattice-Boltzmann solver (BGK, D2Q9 in 2D / D3Q19 in 3D) with half-way \
+         bounce-back bodies, a Zou-Hou style density-pinned outflow, and drag/lift \
+         recovered by boundary momentum exchange, time-averaged over the second \
+         half of the run."
+         .into(),
+    ));
+    rows.push(Row::Body(
+        "For the validated cylinder cases this reproduces published drag \
+         coefficients to roughly 10-15%. Reynolds numbers above the BGK stability \
+         ceiling are simulated at the ceiling and flagged, never silently. 3D \
+         coefficients at the built-in resolutions are rough estimates; use the 2D \
+         module for shape-to-shape comparisons."
+         .into(),
+    ));
+    rows.push(Row::Note(
+        "Not a substitute for engineering analysis or wind-tunnel testing.".into(),
+    ));
+    rows
+}
+
+fn visit_site(url: &str) {
+    let Some(window) = web_sys::window() else {
+        return;
+    };    let in_desktop_shell = window
         .location()
         .protocol()
         .map(|p| p == "app:")

@@ -292,8 +292,8 @@ fn solid_at(lat: &Lbm2D, x: f64, y: f64) -> bool {
 }
 
 /// Deep-navy → steel-blue → pale-cyan ramp; the free stream sits at ~55% so
-/// wake deficits read clearly against it.
-fn speed_color(t: f64) -> [u8; 3] {
+/// wake deficits read clearly against it. Shared with the Pro 3D viewer.
+pub(crate) fn speed_color(t: f64) -> [u8; 3] {
     let stops: [(f64, [u8; 3]); 4] = [
         (0.0, [9, 14, 28]),
         (0.4, [30, 78, 125]),

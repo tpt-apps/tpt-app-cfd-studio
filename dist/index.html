@@ -9,8 +9,8 @@
          already keeps the payload small. -->
     
 <script type="module">
-import init, * as bindings from '/tpt-app-cfd-studio-e0907c98853392c1.js';
-const wasm = await init({ module_or_path: '/tpt-app-cfd-studio-e0907c98853392c1_bg.wasm' });
+import init, * as bindings from '/tpt-app-cfd-studio-87e658ada3172b6b.js';
+const wasm = await init({ module_or_path: '/tpt-app-cfd-studio-87e658ada3172b6b_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -19,7 +19,7 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-  <link rel="modulepreload" href="/tpt-app-cfd-studio-e0907c98853392c1.js" crossorigin="anonymous" integrity="sha384-Ko4TVkIVq7dsOui9k9QebRRb9VNnDbo+s73itTQDQv9pgubtr6c4XMLiHUNGHFHn"><link rel="preload" href="/tpt-app-cfd-studio-e0907c98853392c1_bg.wasm" crossorigin="anonymous" integrity="sha384-TAQ2HMnwUqGrsZsC6uI7rmKJNrmVZ0MzKcX0bkTX9ZC7HvK2mmjPlNXtk+lthb7I" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/tpt-app-cfd-studio-87e658ada3172b6b.js" crossorigin="anonymous" integrity="sha384-6apXaGqbh4M+PB4r1YP9lIASmqWRSwrrvptJJZBDu/9+0T3fLU/qyPM2jP3GKhpe"><link rel="preload" href="/tpt-app-cfd-studio-87e658ada3172b6b_bg.wasm" crossorigin="anonymous" integrity="sha384-COZ6H1TaDkQcChzlRNfcoa/fZvQwzdkBb3OabvOU6mYuVsEs/8OmaAeWTh7CB2UF" as="fetch" type="application/wasm"></head>
   <body>
     <!-- Marker div: `start()` mounts here for standalone dev only; when the
          build is embedded in tptsolutions.co.nz/tools the hub runner calls

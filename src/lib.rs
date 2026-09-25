@@ -15,6 +15,8 @@
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod viewer;
+#[cfg(all(target_arch = "wasm32", feature = "pro"))]
+mod viewer3d;
 
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::prelude::*;

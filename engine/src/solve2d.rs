@@ -20,13 +20,13 @@ use crate::model::{Problem2D, Shape2D};
 /// ceiling at ≈ 5·H cells — the honest limit of a BGK D2Q9 solver
 /// (measured: τ = 0.55 at Ma 0.22 diverged on a shedding cylinder); higher-Re
 /// requests run here, capped and flagged (see [`LatticeInfo::reynolds_capped`]).
-const TAU_MIN: f64 = 0.56;
+pub(crate) const TAU_MIN: f64 = 0.56;
 
 /// Lattice-velocity ladder, low → high Mach (the top is ~Ma 0.17, where
 /// compressibility error is still a few percent). Higher U means a higher
 /// simulated ν for the same Re, i.e. τ further from the stability floor —
 /// this is how moderate-to-high target Reynolds numbers stay stable.
-const U_LADDER: [f64; 3] = [0.05, 0.075, 0.1];
+pub(crate) const U_LADDER: [f64; 3] = [0.05, 0.075, 0.1];
 
 /// A 2D solver error (bad problem parameters).
 #[derive(Debug, Clone)]
@@ -342,7 +342,7 @@ impl Solver2D {
 
 /// τ is already ≥ [`TAU_MIN`] when chosen; `tau_slip` only guards the
 /// capping path where an explicit floor is applied.
-fn tau_slip(tau: f64) -> f64 {
+pub(crate) fn tau_slip(tau: f64) -> f64 {
     tau.max(TAU_MIN)
 }
 

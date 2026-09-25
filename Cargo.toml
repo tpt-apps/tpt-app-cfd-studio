@@ -22,6 +22,8 @@ pro = ["tpt-cfd-engine/pro"]
 tpt-appfront-core = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-core" }
 tpt-appfront-dom = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-appfront/crates/tpt-appfront-dom" }
 tpt-cfd-engine = { path = "engine" }
+# The viewer renders the solver's lattice fields directly.
+tpt-phys-cfd = { path = "D:/Programming/1PRODUCTION/Open Source/tpt-physics/crates/tpt-phys-cfd" }
 # Pinned to the installed wasm-bindgen CLI version — the CLI rejects wasm
 # built against a different schema version. Bump both together.
 wasm-bindgen = "=0.2.128"
@@ -62,4 +64,11 @@ strip = true
 # The desktop shell is a native binary; keep its codegen normal even in the
 # same workspace (the `release` profile above applies to the wasm lib build).
 [profile.release.package.tpt-cfd-desktop]
+opt-level = 3
+
+# The LBM hot loop is throughput-sensitive: opt-level "z" costs roughly 3x
+# on it, and an under-performing solver directly stretches the in-browser
+# animated solve. The engine crate opts into normal codegen even in the wasm
+# build — its size contribution is small next to the UI glue.
+[profile.release.package.tpt-cfd-engine]
 opt-level = 3

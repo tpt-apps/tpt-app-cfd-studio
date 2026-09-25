@@ -1,4 +1,4 @@
-# TPT CFD Studio - build pipeline (Windows).
+﻿# TPT CFD Studio - build pipeline (Windows).
 #
 # Free edition (default):  ./build.ps1
 #   cargo build --release --target wasm32-unknown-unknown (no pro feature)

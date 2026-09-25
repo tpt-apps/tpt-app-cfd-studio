@@ -3430,6 +3430,7 @@ dependencies = [
  "tpt-appfront-core",
  "tpt-appfront-dom",
  "tpt-cfd-engine",
+ "tpt-phys-cfd",
  "wasm-bindgen",
  "web-sys",
 ]

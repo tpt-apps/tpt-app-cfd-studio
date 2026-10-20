@@ -20,6 +20,8 @@ pub mod solve2d;
 #[cfg(feature = "pro")]
 pub mod report;
 #[cfg(feature = "pro")]
+pub mod stl;
+#[cfg(feature = "pro")]
 pub mod threed;
 
 pub use model::{Fluid, Problem2D, Shape2D};

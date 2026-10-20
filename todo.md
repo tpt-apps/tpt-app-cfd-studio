@@ -84,7 +84,90 @@
 - [x] Windows exe build + smoke test (`build.ps1 -Pro` → 1.25 MB exe,
       launches, WebView2 stack active, serves its embedded pro bundle)
 - [ ] Gumroad product from apps.md listing copy ($349), exe upload, URL into
-      registry — manual step, listing copy in `GUMROAD.md`
+      registry — manual step, listing copy in `GUMROAD.md`. **Blocked on
+      Phase 3b**: as built, the Pro edition has five preset 3D shapes, no
+      geometry import, and a laminar 3D solver capped near Re 60 whose
+      coefficients the app itself calls "rough estimates" — not worth $349 to
+      the motorsport/drone audience in the listing.
+
+## Phase 3b — PARKED (3D research track; 2D ships)
+Decision: the 3D solver is not sellable as-is. Findings:
+- LES validation at 12 cells, Re 10⁵, 6 000 steps: cube Cd 1.06 (ref ≈ 1.05),
+  sphere 0.76 (ref ≈ 0.47), Ahmed 0.93 (ref 0.285, with ground — not
+  comparable), plate 1.11, 4:1 ellipsoid 0.80 (should be far below the sphere).
+  Shape ranking fails for the streamlined body.
+- Root cause: the 3D solver does not simulate the requested Reynolds number.
+  The molecular τ floor (0.502) gives a molecular Re ≈ 900 at 12 cells, and the
+  Smagorinsky term can only add viscosity. Re 10³ and Re 10⁵ produce identical
+  results. Laminar BGK holds only for Re ≲ 30 at 12 cells.
+- Reynolds matching needs a wall-modelled LES calibrated against published data
+  and validated across Re, on a finer grid. Estimated: weeks plus substantial
+  compute, no guarantee. Not started.
+- The 3D code remains in the repo behind the `pro` feature (not wired to any
+  product claim). Shelved until a customer needs Reynolds-matched 3D data.
+
+Shipping: 2D solver (validated cylinder Re 20/40/100 and streamlined ranking),
+free edition plus a 2D Pro tier (coefficient readout, PNG and PDF export).
+Price: $49 one-time (decided). See `GUMROAD.md`.
+
+Archived task list (for reference only, not active):
+Why: real car/drone flows are turbulent (Re ~10⁵–10⁷) and users need to run
+their own parts. Neither works today.
+
+Done so far:
+- [x] Fix 3D picker highlight bug (class attribute got the selector's leading
+      dot, so shape/resolution selection never showed) — `src/app.rs`
+- [x] Pro header chip no longer says "free · 2D qualitative"
+- [x] Dark mode: page `html`/`body` background + `color-scheme` (white strip)
+- [x] Ahmed body (road-car bluff-body reference: 3.6H × 1.35H × H, rounded
+      nose, 25° slant) replaces the box-and-cabin placeholder
+
+To do:
+- [x] **Turbulence model**: Smagorinsky LES in the D3Q19 collision step
+      (non-equilibrium momentum flux → effective τ), switched on when the
+      laminar BGK would fall below `TAU_MIN`. Removes the Re ≈ 5·H-cells
+      ceiling (≈ Re 60 at 12 cells). Report "turbulent (LES)" instead of
+      "capped"; keep laminar BGK below the stable band so the 2D-validated
+      low-Re behaviour doesn't change. Needs a τ floor and a stability check
+      at Re 10⁵–10⁶.
+- [x] **STL import** (engine): binary + ASCII STL parser; voxelise the mesh into
+      the lattice (ray parity along the flow axis; scale so the up-axis extent
+      = body height); size the domain from the mesh extents (nx/ny/nz);
+      frontal area from the mask (already done); cell-count cap with a clear
+      error; unit tests (cube, icosphere volume vs analytic, binary/ASCII
+      round-trip, non-watertight handling).
+- [x] **STL import** (UI): file picker (`<input type=file accept=.stl>` →
+      `FileReader` → bytes → engine), loaded-body label with triangle count,
+      "reverse flow" and "up axis Z/Y" toggles, picking a preset clears the
+      mesh. Needs extra `web-sys` features (`File`, `FileReader`, …). Verify
+      the picker works inside the WebView2 shell.
+- [x] **Validation** (release suite, ignored/slow where needed). Measured at
+      Re 10⁵ / 12 cells across the body, 6 000 steps, LES on (`les3d.rs`):
+      - cube (face-on): Cd **1.055** vs ≈ 1.05 published — match
+      - sphere: Cd **0.762** vs ≈ 0.47 published — overpredicts ~60%
+      - Ahmed 25° (Re 10⁶, 8 000 steps): Cd **0.928** vs 0.285 published (with
+        ground plane; model is free-stream) — overpredicts ~3×
+      - imported STL sphere Cd 0.799 vs preset 0.762 (within the 25% bound;
+        measured 5%)
+      - 2D cylinder suite (Re 20/40/100, flat plate, streamlined, capped Re):
+        6/6 pass
+      Not tuned to pass. The 3D gap is the coarse 12-cell lattice; the claim
+      is shape ranking, with absolute coefficients labelled indicative.
+- [x] Update `GUMROAD.md` copy to match what the solver actually delivers
+      (STL import, LES, measured validation; wind-tunnel framing dropped)
+- [ ] Re-take the cover/screenshots after the above (imported real car body,
+      ≥ 1080p, status caveats cropped or resolved); no stock/AI art
+- [x] Re-run `build.ps1 -Pro` (builds clean with `NO_COLOR=1` set; exe produced)
+- [ ] Smoke-test the exe by hand (picker, run, export PNG/PDF) — GUI check, not run here
+
+Housekeeping found along the way:
+- [x] `dist/` is git-tracked but is a build artefact (hashed filenames churn on
+      every build) — untracked and `.gitignore`d
+- [x] `build.ps1` fails when `NO_COLOR=1` is set (trunk 0.21 wants
+      `true`/`false`) — unset it inside the script for the trunk call
+- [ ] Windows Firewall prompts for the app's webview may block input until
+      answered — check whether the shipped exe triggers one and document it
+- [ ] Commit the uncommitted changes in `src/app.rs`, `engine/src/threed.rs`
 
 ## Phase 4 — Ship & measure
 - [x] Registry snippet emitted by `build.ps1` (slug `cfd-studio`, category

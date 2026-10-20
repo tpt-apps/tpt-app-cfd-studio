@@ -44,8 +44,13 @@ Write-Host "== TPT CFD Studio build ==" -ForegroundColor Cyan
 if ($Pro) {
     Write-Host " edition: pro (3D solve + drag/lift coefficients + exports)"
     Write-Host "-- trunk build --release --features pro (standalone bundle for the desktop shell)" -ForegroundColor Cyan
+    # trunk 0.21 rejects NO_COLOR=1 (it wants true/false), so clear it for the call only.
+    $savedNoColor = $env:NO_COLOR
+    Remove-Item Env:NO_COLOR -ErrorAction SilentlyContinue
     trunk build --release --features pro
-    if ($LASTEXITCODE -ne 0) { throw "trunk build failed" }
+    $trunkExit = $LASTEXITCODE
+    $env:NO_COLOR = $savedNoColor
+    if ($trunkExit -ne 0) { throw "trunk build failed" }
 
     Write-Host "-- cargo build --release -p tpt-cfd-desktop (webview exe)" -ForegroundColor Cyan
     cargo build --release -p tpt-cfd-desktop

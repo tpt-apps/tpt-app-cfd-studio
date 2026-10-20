@@ -14,6 +14,23 @@
 use crate::model::Fluid;
 use crate::solve2d::{tau_slip, CfdError, TAU_MIN, U_LADDER};
 
+/// Smagorinsky constant for the turbulence closure (Cs ≈ 0.1–0.17 is the
+/// usual range; the upper end suits separated bluff-body wakes).
+const SMAGORINSKY_CS: f64 = 0.16;
+
+/// Floor on the molecular relaxation time in LES mode. At Re ≫ 10⁴ the
+/// physical viscosity is far below what a few-cell-wide lattice can carry, so
+/// the subgrid (Smagorinsky) viscosity does the dissipating; this keeps the
+/// uniform-stream τ safely above the BGK instability point of 0.5.
+const TAU_LES_FLOOR: f64 = 0.502;
+
+/// Lattice free-stream velocity in LES mode. Measured, not assumed: on a
+/// sphere at Re 10⁵ with 12 cells across, 0.1 diverged (step ~3100) while
+/// 0.05 ran stably for 10 000 steps. Lighter damping (τ floor 0.5005 or
+/// Cs 0.10) diverged even at 0.05, and so did regularised collision and 16
+/// cells — see `engine/tests/les3d.rs` and the notes in `todo.md`.
+const LES_U_LATTICE: f64 = 0.05;
+
 /// The nineteen-velocity D3Q9 lattice: rest, the six axis directions, and
 /// the twelve face diagonals.
 const E3: [(i32, i32, i32); 19] = [
@@ -93,6 +110,13 @@ pub enum Shape3D {
         /// Length-to-height ratio along the flow (clamped to ≥ 1).
         aspect: f64,
     },
+    /// Ahmed body (road-car bluff-body reference): `3.6·H` long, `1.35·H`
+    /// wide, `H` tall, rounded nose and a 25° slanted rear. The slant sets
+    /// the rear-vortex wake that dominates road-car drag.
+    Ahmed,
+    /// A body imported from an STL file (see [`crate::stl`]). The lattice mask
+    /// comes from the voxeliser; this variant only labels the problem.
+    Imported,
 }
 
 impl Shape3D {
@@ -102,6 +126,8 @@ impl Shape3D {
             Shape3D::Cube => "cube",
             Shape3D::Plate => "plate",
             Shape3D::Ellipsoid { .. } => "ellipsoid",
+            Shape3D::Ahmed => "ahmed",
+            Shape3D::Imported => "imported",
         }
     }
 
@@ -111,6 +137,8 @@ impl Shape3D {
             Shape3D::Cube => "Cube",
             Shape3D::Plate => "Flat plate",
             Shape3D::Ellipsoid { .. } => "Streamlined body",
+            Shape3D::Ahmed => "Ahmed body (road car)",
+            Shape3D::Imported => "Imported STL body",
         }
     }
 }
@@ -143,7 +171,13 @@ pub struct LatticeInfo3D {
     pub tau: f64,
     pub u_lattice: f64,
     pub reynolds: f64,
+    /// True only if the requested Reynolds number could not be honoured at
+    /// all. With the turbulence model on (`les`) high Re is simulated, not
+    /// capped, so this stays false there.
     pub reynolds_capped: bool,
+    /// Smagorinsky large-eddy closure is active (Re beyond the laminar BGK
+    /// stability band).
+    pub les: bool,
     pub cell_m: f64,
     pub dt_s: f64,
     /// Projected frontal area of the rasterised body [cells²] — the drag/
@@ -160,6 +194,8 @@ pub struct Solver3D {
     pub nz: usize,
     tau: f64,
     u0: f64,
+    /// Smagorinsky subgrid viscosity on (see [`LatticeInfo3D::les`]).
+    les: bool,
     /// Post-collision distributions (SoA: one lane per lattice velocity).
     f: Vec<[f64; 19]>,
     f_swap: Vec<[f64; 19]>,
@@ -183,6 +219,23 @@ pub struct Solver3D {
 impl Solver3D {
     /// Lays out the lattice for `problem` and initialises a uniform stream.
     pub fn new(problem: &Problem3D) -> Result<Solver3D, CfdError> {
+        Self::build(problem, None)
+    }
+
+    /// Like [`Solver3D::new`], but with an imported body (see [`crate::stl`])
+    /// instead of the preset `problem.shape`. The voxel body fixes the
+    /// domain; `cells_across_body` must be the value it was voxelised with.
+    pub fn from_voxels(
+        problem: &Problem3D,
+        body: crate::stl::VoxelBody,
+    ) -> Result<Solver3D, CfdError> {
+        Self::build(problem, Some(body))
+    }
+
+    fn build(
+        problem: &Problem3D,
+        voxels: Option<crate::stl::VoxelBody>,
+    ) -> Result<Solver3D, CfdError> {
         if !(problem.inlet_velocity > 0.0) || !problem.inlet_velocity.is_finite() {
             return Err(CfdError("inlet velocity must be positive".into()));
         }
@@ -204,30 +257,68 @@ impl Solver3D {
         // Domain: 25% blockage cross-section (4h × 4h) and 8h of streamwise
         // length — 3D blockage effects are milder than 2D, and every cell
         // counts against wall-clock here.
-        let (nx, ny, nz) = (h * 8, h * 4, h * 4);
-        let cy = (ny - 1) as f64 / 2.0;
-        let cz = (nz - 1) as f64 / 2.0;
-        let cx = (3.0 * h as f64).round();
+        let imported = voxels.is_some();
+        let (nx, ny, nz, cx, cy, cz) = match &voxels {
+            Some(v) => (v.nx, v.ny, v.nz, v.centre.0, v.centre.1, v.centre.2),
+            None => {
+                let (nx, ny, nz) = (h * 8, h * 4, h * 4);
+                (
+                    nx,
+                    ny,
+                    nz,
+                    (3.0 * h as f64).round(),
+                    (ny - 1) as f64 / 2.0,
+                    (nz - 1) as f64 / 2.0,
+                )
+            }
+        };
 
         // Same Reynolds→τ ladder as the 2D path (shared constants).
         let re_target = problem.reynolds();
         let mut u0 = *U_LADDER.last().unwrap();
         let mut tau = TAU_MIN;
-        let mut capped = true;
+        let mut les = true;
         for &u in &U_LADDER {
             let t = 3.0 * (u * h as f64 / re_target) + 0.5;
             if t >= TAU_MIN {
                 u0 = u;
                 tau = t;
-                capped = false;
+                les = false;
                 break;
             }
         }
-        let tau = tau_slip(tau);
+        // Beyond the laminar stability band, run the Smagorinsky closure at
+        // the real Reynolds number instead of capping it: the molecular τ
+        // follows the target (floored for stability) and the subgrid
+        // viscosity supplies the rest.
+        if les {
+            // Halving the lattice velocity from the ladder top (0.1 → 0.05)
+            // is what keeps the closure stable on bluff bodies (see the
+            // notes on `LES_U_LATTICE`).
+            u0 = LES_U_LATTICE;
+        }
+        let tau = if les {
+            (3.0 * (u0 * h as f64 / re_target) + 0.5).max(TAU_LES_FLOOR)
+        } else {
+            tau_slip(tau)
+        };
+        let capped = false;
 
         let n = nx * ny * nz;
-        let mut solid = vec![false; n];
-        let half_chord = rasterize3(&mut solid, nx, ny, nz, problem.shape, cx, cy, cz, h as f64);
+        let (solid, half_chord) = match voxels {
+            Some(v) => {
+                if v.solid.len() != n {
+                    return Err(CfdError("imported body does not match its lattice".into()));
+                }
+                (v.solid, v.half_chord)
+            }
+            None => {
+                let mut solid = vec![false; n];
+                let half_chord =
+                    rasterize3(&mut solid, nx, ny, nz, problem.shape, cx, cy, cz, h as f64);
+                (solid, half_chord)
+            }
+        };
         // Drag/lift normalise by the body's projected frontal area: the
         // count of (y,z) columns containing at least one solid cell.
         let frontal_area = {
@@ -267,19 +358,35 @@ impl Solver3D {
         seed3(&mut f, &solid, nx, ny, nz, cx + half_chord + 0.55 * h as f64,
               cy + 0.15 * h as f64, cz, 0.6 * h as f64, [0.0, 0.3 * u0, 0.0]);
 
-        let planned_steps = 3_500;
+        // LES runs at half the lattice velocity, so it needs about twice the
+        // steps to cover the same number of flow-throughs.
+        let planned_steps = if les { 6_000 } else { 3_500 };
         let nu = (tau - 0.5) / 3.0;
+        // Reference length in cells: an imported body is scaled so its
+        // vertical extent is exactly `h` cells; presets use the frontal-area
+        // equivalent as before.
+        let ref_len = if imported {
+            h as f64
+        } else {
+            (frontal_area as f64).sqrt()
+        };
         let info = LatticeInfo3D {
             nx,
             ny,
             nz,
             tau,
             u_lattice: u0,
-            reynolds: u0 * (frontal_area as f64).sqrt() / nu,
+            // Laminar: the lattice Re that was actually set up. LES: the
+            // physical target (the subgrid model carries the difference).
+            reynolds: if les {
+                re_target
+            } else {
+                u0 * ref_len / nu
+            },
             reynolds_capped: capped,
-            cell_m: problem.body_height / (frontal_area as f64).sqrt(),
-            dt_s: problem.body_height / (frontal_area as f64).sqrt() * u0
-                / problem.inlet_velocity,
+            les,
+            cell_m: problem.body_height / ref_len,
+            dt_s: problem.body_height / ref_len * u0 / problem.inlet_velocity,
             frontal_area_cells: frontal_area,
         };
 
@@ -289,6 +396,7 @@ impl Solver3D {
             nz,
             tau,
             u0,
+            les,
             f,
             f_swap: Vec::new(),
             rho,
@@ -430,9 +538,42 @@ impl Solver3D {
             uy *= inv;
             uz *= inv;
             let feq = equilibrium3(rho, [ux, uy, uz]);
+            // Smagorinsky subgrid viscosity, local-τ form (Hou et al.): the
+            // strain rate comes from the non-equilibrium momentum flux Π, so
+            // no velocity gradients are needed.
+            let tau_i = if self.les {
+                let (mut pxx, mut pyy, mut pzz) = (0.0, 0.0, 0.0);
+                let (mut pxy, mut pxz, mut pyz) = (0.0, 0.0, 0.0);
+                for (k, &(ex, ey, ez)) in E3.iter().enumerate() {
+                    let (ex, ey, ez) = (ex as f64, ey as f64, ez as f64);
+                    let fneq = fi[k] - feq[k];
+                    pxx += fneq * ex * ex;
+                    pyy += fneq * ey * ey;
+                    pzz += fneq * ez * ez;
+                    pxy += fneq * ex * ey;
+                    pxz += fneq * ex * ez;
+                    pyz += fneq * ey * ez;
+                }
+                let q = (pxx * pxx
+                    + pyy * pyy
+                    + pzz * pzz
+                    + 2.0 * (pxy * pxy + pxz * pxz + pyz * pyz))
+                    .sqrt();
+                0.5 * (tau
+                    + (tau * tau
+                        + 18.0
+                            * std::f64::consts::SQRT_2
+                            * SMAGORINSKY_CS
+                            * SMAGORINSKY_CS
+                            * q
+                            / rho)
+                        .sqrt())
+            } else {
+                tau
+            };
             let (ix, iy, iz) = (i % nx, (i / nx) % ny, i / (nx * ny));
             for k in 0..19 {
-                let f_post = fi[k] - (fi[k] - feq[k]) / tau;
+                let f_post = fi[k] - (fi[k] - feq[k]) / tau_i;
                 self.f[i][k] = f_post;
                 let (ex, ey, ez) = E3[k];
                 let sx = ix as isize + ex as isize;
@@ -621,6 +762,8 @@ fn rasterize3(
         solid[(iz * ny + iy) * nx + ix] = true;
     };
     match shape {
+        // Imported bodies arrive pre-rasterised; nothing to draw here.
+        Shape3D::Imported => 0.0,
         Shape3D::Sphere => {
             let r = h / 2.0;
             let r2 = r * r;
@@ -684,6 +827,49 @@ fn rasterize3(
                 }
             }
             a
+        }
+        Shape3D::Ahmed => {
+            // Side profile in cells, measured from the nose (u, streamwise)
+            // and the floor (v, vertical). Ahmed proportions in units of H:
+            // length 3.6, width 1.35, nose radius 0.35, slant 0.78 long at 25°.
+            let len = 3.6 * h;
+            let width = 1.35 * h;
+            let r = 0.35 * h;
+            let slant_start = len - 0.78 * h;
+            let slant_tan = (25.0_f64).to_radians().tan();
+            let inside_profile = |u: f64, v: f64| {
+                if u < 0.0 || u > len || v < 0.0 || v > h {
+                    return false;
+                }
+                if u < r {
+                    // Rounded nose: outside the corner circles is not body.
+                    if v < r && (r - u).powi(2) + (r - v).powi(2) > r * r {
+                        return false;
+                    }
+                    if v > h - r && (r - u).powi(2) + (v - (h - r)).powi(2) > r * r {
+                        return false;
+                    }
+                }
+                // Rear slant: the roof drops linearly behind `slant_start`.
+                if u > slant_start && v > h - (u - slant_start) * slant_tan {
+                    return false;
+                }
+                true
+            };
+            let half_len = len / 2.0;
+            for iz in 0..nz {
+                for iy in 0..ny {
+                    for ix in 0..nx {
+                        let u = ix as f64 - cx + half_len;
+                        let v = iy as f64 - cy + h / 2.0;
+                        let dz = iz as f64 - cz;
+                        if dz.abs() <= width / 2.0 && inside_profile(u, v) {
+                            set(solid, ix, iy, iz);
+                        }
+                    }
+                }
+            }
+            half_len
         }
     }
 }

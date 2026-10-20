@@ -21,6 +21,8 @@ use tpt_appfront_core::{create_effect, Signal, UITree};
 use tpt_cfd_engine::{Fluid, Problem2D, Shape2D, Solver2D};
 #[cfg(feature = "pro")]
 use tpt_cfd_engine::threed::{Problem3D, Shape3D, Solver3D};
+#[cfg(feature = "pro")]
+use tpt_cfd_engine::stl::{self, Mesh, Orientation};
 use wasm_bindgen::{closure::Closure, prelude::*, JsCast};
 
 #[cfg(feature = "pro")]
@@ -88,11 +90,12 @@ const SAMPLES: [SampleDef; 4] = [
 
 /// (pro) 3D body shapes in picker order.
 #[cfg(feature = "pro")]
-const SHAPES_3D: [(&str, &str); 4] = [
+const SHAPES_3D: [(&str, &str); 5] = [
     ("Sphere", "sphere"),
     ("Cube", "cube"),
     ("Flat plate", "plate"),
     ("Streamlined", "ellipsoid"),
+    ("Ahmed body", "ahmed"),
 ];
 
 /// (pro) 3D lattice presets: cells across the body. 3D cell counts explode
@@ -129,6 +132,18 @@ enum Msg {
     /// (pro) start (or stop) the 3D solve.
     #[cfg(feature = "pro")]
     Run3D,
+    /// (pro) open the file picker and import an STL body for the 3D solve.
+    #[cfg(feature = "pro")]
+    ImportStl,
+    /// (pro) cycle which model axis the flow runs along (X → Y → Z).
+    #[cfg(feature = "pro")]
+    CycleFlowAxis,
+    /// (pro) reverse the flow direction along its axis.
+    #[cfg(feature = "pro")]
+    ReverseFlow,
+    /// (pro) cycle which model axis is vertical.
+    #[cfg(feature = "pro")]
+    CycleUpAxis,
     /// (pro) download the current 2D flow view as a PNG.
     #[cfg(feature = "pro")]
     ExportPng,
@@ -167,6 +182,12 @@ struct App {
     shape3d: std::cell::Cell<Shape3D>,
     #[cfg(feature = "pro")]
     quality3d: std::cell::Cell<usize>,
+    /// (pro) the imported STL body, if one is loaded (its file name kept for
+    /// the report and status lines).
+    #[cfg(feature = "pro")]
+    mesh3d: RefCell<Option<(String, Rc<Mesh>)>>,
+    #[cfg(feature = "pro")]
+    orient3d: std::cell::Cell<Orientation>,
 }
 
 pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
@@ -212,6 +233,10 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
         shape3d: std::cell::Cell::new(Shape3D::Sphere),
         #[cfg(feature = "pro")]
         quality3d: std::cell::Cell::new(QUALITY_3D[0]),
+        #[cfg(feature = "pro")]
+        mesh3d: RefCell::new(None),
+        #[cfg(feature = "pro")]
+        orient3d: std::cell::Cell::new(Orientation::X_FLOW_Z_UP),
     });
 
     let dispatch: Rc<dyn Fn(Msg)> = {
@@ -237,8 +262,38 @@ pub fn mount_app(container: &web_sys::Element) -> Result<(), JsValue> {
             Msg::VisitSite(url) => visit_site(url),
             #[cfg(feature = "pro")]
             Msg::Shape3D(id) => {
+                // Picking a preset replaces any imported body.
+                *app.mesh3d.borrow_mut() = None;
                 app.shape3d.set(shape3d_from_id(id));
                 patch_shape_buttons_by(&app.container, ".cfd-shape3", id);
+                refresh_stl_labels(&app);
+            }
+            #[cfg(feature = "pro")]
+            Msg::ImportStl => open_stl_picker(&app),
+            #[cfg(feature = "pro")]
+            Msg::CycleFlowAxis => {
+                let mut o = app.orient3d.get();
+                o.flow_axis = (o.flow_axis + 1) % 3;
+                if o.up_axis == o.flow_axis {
+                    o.up_axis = (o.up_axis + 1) % 3;
+                }
+                app.orient3d.set(o);
+                refresh_stl_labels(&app);
+            }
+            #[cfg(feature = "pro")]
+            Msg::ReverseFlow => {
+                app.orient3d.set(app.orient3d.get().reversed());
+                refresh_stl_labels(&app);
+            }
+            #[cfg(feature = "pro")]
+            Msg::CycleUpAxis => {
+                let mut o = app.orient3d.get();
+                o.up_axis = (o.up_axis + 1) % 3;
+                if o.up_axis == o.flow_axis {
+                    o.up_axis = (o.up_axis + 1) % 3;
+                }
+                app.orient3d.set(o);
+                refresh_stl_labels(&app);
             }
             #[cfg(feature = "pro")]
             Msg::Quality3D(q) => {
@@ -309,6 +364,9 @@ fn shell_tree() -> UITree<Msg> {
             header.container(|group| {
                 group.container(|row| {
                     row.heading(2, "CFD Studio");
+                    #[cfg(feature = "pro")]
+                    row.text("pro · 2D + 3D").class("cfd-chip");
+                    #[cfg(not(feature = "pro"))]
                     row.text("free · 2D qualitative").class("cfd-chip");
                 });
                 group
@@ -518,6 +576,33 @@ fn pro_3d_card(view: &mut tpt_appfront_core::ContainerBuilder<Msg>) {
             }
         })
         .class("cfd-shapes");
+        card.container(|tools| {
+            tools
+                .button("Import STL…")
+                .class("cfd-sample")
+                .on_click(Msg::ImportStl);
+            tools
+                .button("Flow axis")
+                .class("cfd-sample")
+                .on_click(Msg::CycleFlowAxis);
+            tools
+                .button("Reverse flow")
+                .class("cfd-sample")
+                .on_click(Msg::ReverseFlow);
+            tools
+                .button("Up axis")
+                .class("cfd-sample")
+                .on_click(Msg::CycleUpAxis);
+        })
+        .class("cfd-3d-tools");
+        card.container(|line| {
+            line.text("Pick a preset shape, or import an STL of your own part.");
+        })
+        .class("cfd-stl-label");
+        card.container(|line| {
+            line.text("Flow: +X · Up: +Z");
+        })
+        .class("cfd-orient-label");
         card.container(|field| {
             field.text("3D resolution").class("cfd-label");
             field.container(|row| {
@@ -811,6 +896,8 @@ fn update_3d(app: &Rc<App>) {
             fmt_re(solver.problem().reynolds()),
             re
         )
+    } else if info.les {
+        format!("Re = {} · turbulent (Smagorinsky LES)", re)
     } else {
         format!("Re = {}", re)
     };
@@ -994,6 +1081,7 @@ fn shape3d_from_id(id: &str) -> Shape3D {
         "cube" => Shape3D::Cube,
         "plate" => Shape3D::Plate,
         "ellipsoid" => Shape3D::Ellipsoid { aspect: 2.5 },
+        "ahmed" => Shape3D::Ahmed,
         _ => Shape3D::Sphere,
     }
 }
@@ -1002,6 +1090,8 @@ fn shape3d_from_id(id: &str) -> Shape3D {
 /// 2D and Pro pickers, which live in the mounted-once tree).
 #[cfg(feature = "pro")]
 fn patch_shape_buttons_by(container: &web_sys::Element, class: &str, selected: &str) {
+    // `class` is a selector (".cfd-shape3"); the class attribute needs the bare name.
+    let name = class.trim_start_matches('.');
     for (_, id) in SHAPES_3D {
         if let Some(Some(el)) = container
             .query_selector(&format!("{class}[data-shape3='{id}']"))
@@ -1009,9 +1099,9 @@ fn patch_shape_buttons_by(container: &web_sys::Element, class: &str, selected: &
             .map(|o| o)
         {
             let cls = if id == selected {
-                format!("{class} cfd-sel")
+                format!("{name} cfd-sel")
             } else {
-                class.to_string()
+                name.to_string()
             };
             let _ = el.set_attribute("class", &cls);
         }
@@ -1021,6 +1111,8 @@ fn patch_shape_buttons_by(container: &web_sys::Element, class: &str, selected: &
 /// Highlights the selected option among a same-class button group.
 #[cfg(feature = "pro")]
 fn patch_buttons_by(container: &web_sys::Element, class: &str, selected: usize, labels: &[&str]) {
+    // `class` is a selector (".cfd-q3"); the class attribute needs the bare name.
+    let name = class.trim_start_matches('.');
     for (i, label) in labels.iter().enumerate() {
         if let Some(Some(el)) = container
             .query_selector(&format!("{class}:nth-of-type({})", i + 1))
@@ -1029,9 +1121,9 @@ fn patch_buttons_by(container: &web_sys::Element, class: &str, selected: usize, 
         {
             let _ = el.set_text_content(Some(label));
             let cls = if i == selected {
-                format!("{class} cfd-sel")
+                format!("{name} cfd-sel")
             } else {
-                class.to_string()
+                name.to_string()
             };
             let _ = el.set_attribute("class", &cls);
         }
@@ -1057,14 +1149,37 @@ fn start_3d_from_fields(app: &Rc<App>) {
         set_status3d(&app.container, "3D — speed/size are outside their ranges.", "");
         return;
     }
+    let mesh = app.mesh3d.borrow().clone();
     let problem = Problem3D {
-        shape: app.shape3d.get(),
+        shape: if mesh.is_some() {
+            Shape3D::Imported
+        } else {
+            app.shape3d.get()
+        },
         body_height: size,
         inlet_velocity: speed,
         fluid: Fluid::AIR,
         cells_across_body: app.quality3d.get(),
     };
-    match Solver3D::new(&problem) {
+    let built = match &mesh {
+        Some((_, m)) => stl::voxelize(m, app.orient3d.get(), problem.cells_across_body).and_then(
+            |body| {
+                // A few unclosed columns are tolerable (they stay empty); a
+                // lot means the file isn't a solid and the result would lie.
+                if body.skipped_columns * 50 > body.covered_columns {
+                    Err(tpt_cfd_engine::CfdError(format!(
+                        "the STL is not watertight ({} of {} cross-section columns are open) — \
+                         repair it in a mesh tool (MeshLab, Blender) and import again",
+                        body.skipped_columns, body.covered_columns
+                    )))
+                } else {
+                    Solver3D::from_voxels(&problem, body)
+                }
+            },
+        ),
+        None => Solver3D::new(&problem),
+    };
+    match built {
         Ok(solver) => {
             *app.solver3d.borrow_mut() = Some(solver);
             app.running3d.set(true);
@@ -1096,6 +1211,104 @@ fn set_run3d_label(container: &web_sys::Element, running: bool) {
 fn set_status3d(container: &web_sys::Element, main: &str, note: &str) {
     set_text(container, ".cfd-status3d-main", main);
     set_text(container, ".cfd-status3d-note", note);
+}
+
+#[cfg(feature = "pro")]
+fn axis_name(axis: usize) -> &'static str {
+    ["X", "Y", "Z"][axis.min(2)]
+}
+
+/// (pro) refreshes the STL / orientation lines under the 3D shape picker.
+#[cfg(feature = "pro")]
+fn refresh_stl_labels(app: &Rc<App>) {
+    let o = app.orient3d.get();
+    let sign = |s: f32| if s < 0.0 { '-' } else { '+' };
+    set_text(
+        &app.container,
+        ".cfd-orient-label",
+        &format!(
+            "Flow: {}{} · Up: {}{}  (model axes)",
+            sign(o.flow_sign),
+            axis_name(o.flow_axis),
+            sign(o.up_sign),
+            axis_name(o.up_axis)
+        ),
+    );
+    let label = match &*app.mesh3d.borrow() {
+        Some((name, mesh)) => {
+            let e = mesh.extent();
+            format!(
+                "STL: {name} · {} triangles · {:.3} × {:.3} × {:.3} model units (X×Y×Z). \
+                 Scaled so its height equals the Body frontal height above.",
+                mesh.triangle_count(),
+                e[0],
+                e[1],
+                e[2]
+            )
+        }
+        None => "Pick a preset shape, or import an STL of your own part.".to_string(),
+    };
+    set_text(&app.container, ".cfd-stl-label", &label);
+}
+
+/// (pro) opens the OS file picker; the chosen STL is read in the page and
+/// handed to [`load_stl`].
+#[cfg(feature = "pro")]
+fn open_stl_picker(app: &Rc<App>) {
+    let Some(document) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    let Ok(input) = document
+        .create_element("input")
+        .and_then(|el| el.dyn_into::<web_sys::HtmlInputElement>().map_err(Into::into))
+    else {
+        return;
+    };
+    input.set_type("file");
+    input.set_accept(".stl,model/stl,application/sla");
+    let app = app.clone();
+    let picked = input.clone();
+    let on_change = Closure::once(move |_: web_sys::Event| {
+        let Some(file) = picked.files().and_then(|files| files.get(0)) else {
+            return;
+        };
+        let name = file.name();
+        let Ok(reader) = web_sys::FileReader::new() else {
+            return;
+        };
+        let done = reader.clone();
+        let on_load = Closure::once(move |_: web_sys::Event| {
+            if let Ok(buffer) = done.result() {
+                let bytes = js_sys::Uint8Array::new(&buffer).to_vec();
+                load_stl(&app, &name, &bytes);
+            }
+        });
+        reader.set_onload(Some(on_load.as_ref().unchecked_ref()));
+        on_load.forget();
+        let _ = reader.read_as_array_buffer(&file);
+    });
+    input.set_onchange(Some(on_change.as_ref().unchecked_ref()));
+    on_change.forget();
+    input.click();
+}
+
+/// (pro) parses an STL and makes it the current 3D body.
+#[cfg(feature = "pro")]
+fn load_stl(app: &Rc<App>, name: &str, bytes: &[u8]) {
+    match stl::parse_stl(bytes) {
+        Ok(mesh) => {
+            *app.mesh3d.borrow_mut() = Some((name.to_string(), Rc::new(mesh)));
+            app.shape3d.set(Shape3D::Imported);
+            patch_shape_buttons_by(&app.container, ".cfd-shape3", "");
+            refresh_stl_labels(app);
+            set_status3d(
+                &app.container,
+                "3D — STL loaded.",
+                "Check the flow and up axes, then press Run 3D solve.",
+            );
+        }
+        Err(error) => set_status3d(&app.container, "3D — cannot read that STL:", &error.0),
+    }
 }
 
 /// Writes text content into the (container-wrapped) node at `selector`.
@@ -1371,6 +1584,9 @@ fn upsert_style(document: &web_sys::Document, id: &str, css: &str) {
 }
 
 const BASE_CSS: &str = r#"
+:root{color-scheme:light dark;background:#f7f8fa}
+body{margin:0;background:#f7f8fa}
+@media(prefers-color-scheme:dark){:root,body{background:#0b0f16}}
 .cfd-app{--cfd-bg:#f7f8fa;--cfd-surface:#ffffff;--cfd-panel:#f2f4f7;--cfd-fg:#181d27;--cfd-muted:#667085;--cfd-border:#e3e7ee;--cfd-accent:#0e7c6b;--cfd-accent-2:#0a5f52;--cfd-accent-soft:#e6f5f2;--cfd-accent-fg:#ffffff;--cfd-err:#b3261e;max-width:1360px;margin:0 auto;background:var(--cfd-bg);color:var(--cfd-fg);font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;font-size:14.5px;line-height:1.55;padding:0 4px 32px}
 @media(prefers-color-scheme:dark){.cfd-app{--cfd-bg:#0b0f16;--cfd-surface:#141a24;--cfd-panel:#161d2a;--cfd-fg:#e8ebf0;--cfd-muted:#98a2b3;--cfd-border:#262f3d;--cfd-accent:#34b39a;--cfd-accent-2:#4fd6ba;--cfd-accent-soft:#122824;--cfd-accent-fg:#04140f}}
 .cfd-app *{box-sizing:border-box}
@@ -1392,8 +1608,11 @@ const BASE_CSS: &str = r#"
 .cfd-input{width:100%;padding:8px 10px;border:1px solid var(--cfd-border);border-radius:8px;background:var(--cfd-surface);color:var(--cfd-fg);font:inherit}
 .cfd-input:focus{outline:2px solid var(--cfd-accent);outline-offset:-1px}
 .cfd-shapes{display:grid;grid-template-columns:1fr 1fr;gap:8px}
-.cfd-shape,.cfd-q,.cfd-sample,.cfd-run-btn,.cfd-upsell-btn{font:inherit;font-weight:600;padding:8px 10px;border-radius:8px;border:1px solid var(--cfd-border);background:var(--cfd-panel);color:var(--cfd-fg);cursor:pointer;text-align:left}
-.cfd-shape:hover,.cfd-q:hover,.cfd-sample:hover{border-color:var(--cfd-accent)}
+.cfd-shape,.cfd-q,.cfd-shape3,.cfd-q3,.cfd-sample,.cfd-run-btn,.cfd-upsell-btn{font:inherit;font-weight:600;padding:8px 10px;border-radius:8px;border:1px solid var(--cfd-border);background:var(--cfd-panel);color:var(--cfd-fg);cursor:pointer;text-align:left}
+.cfd-shape:hover,.cfd-q:hover,.cfd-shape3:hover,.cfd-q3:hover,.cfd-sample:hover{border-color:var(--cfd-accent)}
+.cfd-3d-tools{display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:10px}
+.cfd-3d-tools .cfd-sample{margin-top:0}
+.cfd-stl-label,.cfd-orient-label{color:var(--cfd-muted);font-size:.8rem;margin-top:6px}
 .cfd-sel{border-color:var(--cfd-accent);background:var(--cfd-accent-soft);color:var(--cfd-accent);font-weight:700}
 .cfd-sample{margin-top:8px;width:100%}
 .cfd-actions{display:flex;gap:10px}
